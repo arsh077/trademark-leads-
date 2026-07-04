@@ -42,6 +42,13 @@ function initFirebase() {
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
   const privateKey  = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 
+  console.log('🔍 Firebase Diagnostic Info:', {
+    FIREBASE_SERVICE_ACCOUNT_PATH: serviceAccountPath ? 'exists' : 'missing/empty',
+    FIREBASE_PROJECT_ID: projectId ? 'exists' : 'missing/empty',
+    FIREBASE_CLIENT_EMAIL: clientEmail ? 'exists' : 'missing/empty',
+    FIREBASE_PRIVATE_KEY: privateKey ? `exists (length: ${privateKey.length})` : 'missing/empty'
+  });
+
   if (projectId && clientEmail && privateKey) {
     initializeApp({
       credential: cert({ projectId, clientEmail, privateKey } as any),
