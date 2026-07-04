@@ -1,6 +1,7 @@
-import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import { randomUUID } from 'crypto';
 import { GoogleGenAI, Type } from '@google/genai';
@@ -10,6 +11,16 @@ import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import { createRequire } from 'module';
 import * as fs from 'fs';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Dynamic check to find .env in root folder, even if running from dist/
+let envPath = path.resolve(__dirname, '.env');
+if (!fs.existsSync(envPath)) {
+  envPath = path.resolve(__dirname, '..', '.env');
+}
+dotenv.config({ path: envPath });
 
 const require = createRequire(import.meta.url);
 const { initializeApp, cert, getApps } = require('firebase-admin/app');
