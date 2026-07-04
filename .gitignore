@@ -2,7 +2,7 @@ node_modules/
 build/
 dist/
 coverage/
-.DS_Store
+firebase-service-account*.json
 *.log
 .env*
 !.env.example

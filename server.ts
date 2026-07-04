@@ -7,11 +7,59 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
+import * as admin from 'firebase-admin';
+import * as fs from 'fs';
+
+// ─── Firebase Init ──────────────────────────────────────────────────────────────
+// Supports: service account JSON file OR individual env vars
+
+function initFirebase() {
+  if (admin.apps.length > 0) return; // already initialized
+
+  // Option 1: Full service account JSON file path
+  const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+  if (serviceAccountPath) {
+    try {
+      const raw = fs.readFileSync(serviceAccountPath, 'utf8');
+      const serviceAccount = JSON.parse(raw);
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount as admin.ServiceAccount),
+      });
+      console.log('✅ Firebase initialized via service account file');
+      return;
+    } catch (e: any) {
+      console.error('❌ Failed to read service account file:', e.message);
+      process.exit(1);
+    }
+  }
+
+  // Option 2: Individual environment variables (easier for deployment)
+  const projectId   = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const privateKey  = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+
+  if (projectId && clientEmail && privateKey) {
+    admin.initializeApp({
+      credential: admin.credential.cert({ projectId, clientEmail, privateKey }),
+    });
+    console.log('✅ Firebase initialized via environment variables');
+    return;
+  }
+
+  console.error('❌ Firebase not configured! Set FIREBASE_SERVICE_ACCOUNT_PATH or (FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY)');
+  process.exit(1);
+}
+
+initFirebase();
+const db = admin.firestore();
+
+// Firestore collection references
+const employeesCol = db.collection('employees');
+const leadsCol     = db.collection('leads');
+const configCol    = db.collection('config');
 
 const PORT = 3000;
 const BCRYPT_ROUNDS = 10;
-
-// JWT Secret — must be set in environment for production
 const JWT_SECRET = process.env.JWT_SECRET || randomUUID() + randomUUID();
 
 // ─── AI Client ─────────────────────────────────────────────────────────────────
@@ -20,9 +68,7 @@ let aiClient: GoogleGenAI | null = null;
 function getAiClient() {
   if (!aiClient) {
     const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new Error('GEMINI_API_KEY environment variable is required.');
-    }
+    if (!apiKey) throw new Error('GEMINI_API_KEY environment variable is required.');
     aiClient = new GoogleGenAI({
       apiKey,
       httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
@@ -35,8 +81,8 @@ function getAiClient() {
 
 interface Employee {
   id: string;
-  loginId?: string;
-  passwordHash?: string;
+  loginId: string;
+  passwordHash: string;
   name: string;
   active: boolean;
   leadCount: number;
@@ -50,13 +96,7 @@ interface Lead {
   status: 'New' | 'Contacted' | 'Closed';
   notes?: string;
   followUpDate?: string;
-  timeline?: {
-    id: string;
-    action: string;
-    user: string;
-    timestamp: string;
-    notes?: string;
-  }[];
+  timeline?: { id: string; action: string; user: string; timestamp: string; notes?: string; }[];
   updatedAt?: string;
   createdAt: string;
 }
@@ -67,39 +107,58 @@ interface AdminProfile {
   passwordHash: string;
 }
 
-// ─── In-memory Database ─────────────────────────────────────────────────────────
+// ─── Firestore Helpers ──────────────────────────────────────────────────────────
 
-let employees: Employee[] = [];
-let leads: Lead[] = [];
-
-// Default admin password: "admin" — hashed securely
-let adminProfile: AdminProfile = {
-  name: 'Admin',
-  loginId: 'admin',
-  passwordHash: bcrypt.hashSync('admin', BCRYPT_ROUNDS)
-};
-
-// ─── Helpers ────────────────────────────────────────────────────────────────────
-
-function syncLeadCounts() {
-  employees.forEach(emp => {
-    emp.leadCount = leads.filter(l => l.assignedTo === emp.id).length;
-  });
+async function getEmployees(): Promise<Employee[]> {
+  const snap = await employeesCol.get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() } as Employee));
 }
 
-/** Strip password hash before sending employee data to clients */
+async function getLeads(): Promise<Lead[]> {
+  const snap = await leadsCol.orderBy('createdAt', 'asc').get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() } as Lead));
+}
+
+async function getAdminProfile(): Promise<AdminProfile> {
+  const doc = await configCol.doc('adminProfile').get();
+  if (!doc.exists) {
+    // First-time: seed default admin
+    const defaultAdmin: AdminProfile = {
+      name: 'Admin',
+      loginId: 'admin',
+      passwordHash: bcrypt.hashSync('admin', BCRYPT_ROUNDS),
+    };
+    await configCol.doc('adminProfile').set(defaultAdmin);
+    return defaultAdmin;
+  }
+  return doc.data() as AdminProfile;
+}
+
+/** leadCount = number of leads assigned to each employee (computed from Firestore) */
+async function syncLeadCounts(emps: Employee[], allLeads: Lead[]): Promise<void> {
+  const batch = db.batch();
+  for (const emp of emps) {
+    const count = allLeads.filter(l => l.assignedTo === emp.id).length;
+    if (emp.leadCount !== count) {
+      batch.update(employeesCol.doc(emp.id), { leadCount: count });
+      emp.leadCount = count;
+    }
+  }
+  await batch.commit();
+}
+
 function sanitizeEmployee(emp: Employee) {
   const { passwordHash, ...safe } = emp;
   return safe;
 }
 
-/** Strip password hash from admin profile before sending */
 function sanitizeAdminProfile(profile: AdminProfile) {
   const { passwordHash, ...safe } = profile;
   return safe;
 }
 
-// Input length limits
+// ─── Input Limits ───────────────────────────────────────────────────────────────
+
 const MAX_NAME_LEN = 120;
 const MAX_LOGIN_ID_LEN = 60;
 const MAX_PASSWORD_LEN = 128;
@@ -111,7 +170,7 @@ function sanitizeStr(val: unknown, maxLen = 255): string {
   return val.trim().substring(0, maxLen);
 }
 
-// ─── JWT Middleware ─────────────────────────────────────────────────────────────
+// ─── JWT Auth ───────────────────────────────────────────────────────────────────
 
 interface AuthPayload {
   userId: string;
@@ -120,12 +179,11 @@ interface AuthPayload {
 
 function requireAuth(req: Request, res: Response, next: NextFunction) {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+  if (!authHeader?.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Authentication required' });
   }
-  const token = authHeader.substring(7);
   try {
-    const payload = jwt.verify(token, JWT_SECRET) as AuthPayload;
+    const payload = jwt.verify(authHeader.substring(7), JWT_SECRET) as AuthPayload;
     (req as any).auth = payload;
     next();
   } catch {
@@ -145,164 +203,219 @@ function requireAdmin(req: Request, res: Response, next: NextFunction) {
 // ─── Rate Limiters ──────────────────────────────────────────────────────────────
 
 const loginRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,   // 15 minutes
-  max: 20,                     // max 20 attempts per IP per 15 min
-  standardHeaders: true,
-  legacyHeaders: false,
+  windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false,
   message: { error: 'Too many login attempts. Please wait 15 minutes and try again.' }
 });
 
 const apiRateLimiter = rateLimit({
-  windowMs: 60 * 1000,         // 1 minute
-  max: 200,                    // 200 requests per IP per minute
-  standardHeaders: true,
-  legacyHeaders: false,
+  windowMs: 60 * 1000, max: 200, standardHeaders: true, legacyHeaders: false,
   message: { error: 'Too many requests. Please slow down.' }
 });
+
+// ─── Distribution Helper ─────────────────────────────────────────────────────────
+
+/** Get employee with fewest leads assigned */
+function pickAssignee(emps: Employee[]): Employee | null {
+  if (emps.length === 0) return null;
+  return [...emps].sort((a, b) => a.leadCount - b.leadCount)[0];
+}
 
 // ─── Server ─────────────────────────────────────────────────────────────────────
 
 async function startServer() {
   const app = express();
 
-  // Security headers (CSP, HSTS, X-Frame-Options, etc.)
-  app.use(helmet({
-    contentSecurityPolicy: false, // Disabled so Vite HMR works in dev
-  }));
-
+  app.use(helmet({ contentSecurityPolicy: false }));
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
   app.use('/api/', apiRateLimiter);
 
-  // ── Auth ──────────────────────────────────────────────────────────────────────
+  // ── Login ─────────────────────────────────────────────────────────────────────
 
   app.post('/api/login', loginRateLimiter, async (req, res) => {
-    const loginId = sanitizeStr(req.body.loginId, MAX_LOGIN_ID_LEN);
-    const password = sanitizeStr(req.body.password, MAX_PASSWORD_LEN);
+    try {
+      const loginId  = sanitizeStr(req.body.loginId, MAX_LOGIN_ID_LEN);
+      const password = sanitizeStr(req.body.password, MAX_PASSWORD_LEN);
 
-    if (!loginId || !password) {
-      return res.status(400).json({ error: 'Login ID and password are required' });
-    }
+      if (!loginId || !password) {
+        return res.status(400).json({ error: 'Login ID and password are required' });
+      }
 
-    // Admin check
-    if (loginId.toLowerCase() === adminProfile.loginId.toLowerCase()) {
-      const valid = await bcrypt.compare(password, adminProfile.passwordHash);
+      const adminProfile = await getAdminProfile();
+
+      // Admin check
+      if (loginId.toLowerCase() === adminProfile.loginId.toLowerCase()) {
+        const valid = await bcrypt.compare(password, adminProfile.passwordHash);
+        if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+        const token = jwt.sign({ userId: 'admin', role: 'admin' } as AuthPayload, JWT_SECRET, { expiresIn: '12h' });
+        return res.json({ id: 'admin', role: 'admin', token });
+      }
+
+      // Employee check — query Firestore by loginId
+      const empSnap = await employeesCol.where('loginId', '==', loginId).limit(1).get();
+      if (empSnap.empty) return res.status(401).json({ error: 'Invalid credentials' });
+
+      const empDoc = empSnap.docs[0];
+      const emp = { id: empDoc.id, ...empDoc.data() } as Employee;
+
+      const valid = await bcrypt.compare(password, emp.passwordHash);
       if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-      const token = jwt.sign({ userId: 'admin', role: 'admin' } as AuthPayload, JWT_SECRET, { expiresIn: '12h' });
-      return res.json({ id: 'admin', role: 'admin', token });
+      if (!emp.active) return res.status(403).json({ error: 'Account is inactive. Contact admin.' });
+
+      const token = jwt.sign({ userId: emp.id, role: 'employee' } as AuthPayload, JWT_SECRET, { expiresIn: '12h' });
+      return res.json({ id: emp.id, role: 'employee', token });
+
+    } catch (err: any) {
+      console.error('Login error:', err);
+      return res.status(500).json({ error: 'Server error during login' });
     }
-
-    // Employee check
-    const emp = employees.find(e => e.loginId?.toLowerCase() === loginId.toLowerCase());
-    if (!emp || !emp.passwordHash) return res.status(401).json({ error: 'Invalid credentials' });
-    const valid = await bcrypt.compare(password, emp.passwordHash);
-    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-    if (!emp.active) return res.status(403).json({ error: 'Account is inactive. Contact admin.' });
-
-    const token = jwt.sign({ userId: emp.id, role: 'employee' } as AuthPayload, JWT_SECRET, { expiresIn: '12h' });
-    return res.json({ id: emp.id, role: 'employee', token });
   });
 
   // ── State ─────────────────────────────────────────────────────────────────────
 
-  app.get('/api/state', requireAuth, (req, res) => {
-    syncLeadCounts();
-    // Employees: never send password hash
-    const safeEmployees = employees.map(sanitizeEmployee);
-    res.json({
-      employees: safeEmployees,
-      leads,
-      adminProfile: sanitizeAdminProfile(adminProfile)
-    });
+  app.get('/api/state', requireAuth, async (req, res) => {
+    try {
+      const [employees, leads, adminProfile] = await Promise.all([
+        getEmployees(), getLeads(), getAdminProfile()
+      ]);
+      await syncLeadCounts(employees, leads);
+
+      res.json({
+        employees: employees.map(sanitizeEmployee),
+        leads,
+        adminProfile: sanitizeAdminProfile(adminProfile)
+      });
+    } catch (err: any) {
+      console.error('State fetch error:', err);
+      res.status(500).json({ error: 'Failed to fetch state' });
+    }
   });
 
   // ── Employees ─────────────────────────────────────────────────────────────────
 
   app.post('/api/employees', requireAdmin, async (req, res) => {
-    const name    = sanitizeStr(req.body.name, MAX_NAME_LEN);
-    const loginId = sanitizeStr(req.body.loginId, MAX_LOGIN_ID_LEN);
-    const password = sanitizeStr(req.body.password, MAX_PASSWORD_LEN);
+    try {
+      const name     = sanitizeStr(req.body.name, MAX_NAME_LEN);
+      const loginId  = sanitizeStr(req.body.loginId, MAX_LOGIN_ID_LEN);
+      const password = sanitizeStr(req.body.password, MAX_PASSWORD_LEN);
 
-    if (!name || !loginId) {
-      return res.status(400).json({ error: 'Name and Login ID are required' });
+      if (!name || !loginId) return res.status(400).json({ error: 'Name and Login ID are required' });
+      if (!password || password.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+
+      // Check duplicate loginId in Firestore
+      const [adminProfile, dupSnap] = await Promise.all([
+        getAdminProfile(),
+        employeesCol.where('loginId', '==', loginId).limit(1).get()
+      ]);
+
+      if (!dupSnap.empty || loginId.toLowerCase() === adminProfile.loginId.toLowerCase()) {
+        return res.status(400).json({ error: 'Login ID already exists' });
+      }
+
+      const id = randomUUID();
+      const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+      const emp: Employee = { id, loginId, passwordHash, name, active: true, leadCount: 0 };
+
+      await employeesCol.doc(id).set(emp);
+      res.json(sanitizeEmployee(emp));
+
+    } catch (err: any) {
+      console.error('Add employee error:', err);
+      res.status(500).json({ error: 'Failed to create employee' });
     }
-    if (!password || password.length < 4) {
-      return res.status(400).json({ error: 'Password must be at least 4 characters' });
-    }
-
-    const isDuplicate = employees.some(e => e.loginId?.toLowerCase() === loginId.toLowerCase())
-      || loginId.toLowerCase() === adminProfile.loginId.toLowerCase();
-    if (isDuplicate) return res.status(400).json({ error: 'Login ID already exists' });
-
-    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    const emp: Employee = {
-      id: randomUUID(),
-      loginId,
-      passwordHash,
-      name,
-      active: true,
-      leadCount: 0
-    };
-    employees.push(emp);
-    res.json(sanitizeEmployee(emp));
   });
 
   app.patch('/api/employees/:id', requireAdmin, async (req, res) => {
-    const emp = employees.find(e => e.id === req.params.id);
-    if (!emp) return res.status(404).json({ error: 'Employee not found' });
+    try {
+      const docRef = employeesCol.doc(req.params.id);
+      const snap = await docRef.get();
+      if (!snap.exists) return res.status(404).json({ error: 'Employee not found' });
 
-    if (req.body.active !== undefined) {
-      emp.active = Boolean(req.body.active);
+      const emp = { id: snap.id, ...snap.data() } as Employee;
+      const updates: Partial<Employee> = {};
+
+      if (req.body.active !== undefined)  updates.active = Boolean(req.body.active);
+      if (req.body.name !== undefined)    updates.name = sanitizeStr(req.body.name, MAX_NAME_LEN);
+
+      if (req.body.loginId !== undefined) {
+        const newLoginId = sanitizeStr(req.body.loginId, MAX_LOGIN_ID_LEN);
+        const [adminProfile, dupSnap] = await Promise.all([
+          getAdminProfile(),
+          employeesCol.where('loginId', '==', newLoginId).limit(1).get()
+        ]);
+        const isDup = (!dupSnap.empty && dupSnap.docs[0].id !== req.params.id)
+          || newLoginId.toLowerCase() === adminProfile.loginId.toLowerCase();
+        if (isDup) return res.status(400).json({ error: 'Login ID already exists' });
+        updates.loginId = newLoginId;
+      }
+
+      if (req.body.password !== undefined) {
+        const newPwd = sanitizeStr(req.body.password, MAX_PASSWORD_LEN);
+        if (newPwd.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+        updates.passwordHash = await bcrypt.hash(newPwd, BCRYPT_ROUNDS);
+      }
+
+      await docRef.update(updates as any);
+      const updated = { ...emp, ...updates };
+      res.json(sanitizeEmployee(updated));
+
+    } catch (err: any) {
+      console.error('Update employee error:', err);
+      res.status(500).json({ error: 'Failed to update employee' });
     }
-    if (req.body.name !== undefined) {
-      emp.name = sanitizeStr(req.body.name, MAX_NAME_LEN);
-    }
-    if (req.body.loginId !== undefined) {
-      const newLoginId = sanitizeStr(req.body.loginId, MAX_LOGIN_ID_LEN);
-      const isDuplicate = employees.some(e => e.loginId?.toLowerCase() === newLoginId.toLowerCase() && e.id !== req.params.id)
-        || newLoginId.toLowerCase() === adminProfile.loginId.toLowerCase();
-      if (isDuplicate) return res.status(400).json({ error: 'Login ID already exists' });
-      emp.loginId = newLoginId;
-    }
-    if (req.body.password !== undefined) {
-      const newPwd = sanitizeStr(req.body.password, MAX_PASSWORD_LEN);
-      if (newPwd.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
-      emp.passwordHash = await bcrypt.hash(newPwd, BCRYPT_ROUNDS);
-    }
-    res.json(sanitizeEmployee(emp));
   });
 
-  app.delete('/api/employees/:id', requireAdmin, (req, res) => {
-    employees = employees.filter(e => e.id !== req.params.id);
-    leads.forEach(l => {
-      if (l.assignedTo === req.params.id) l.assignedTo = null;
-    });
-    res.json({ success: true });
+  app.delete('/api/employees/:id', requireAdmin, async (req, res) => {
+    try {
+      const empId = req.params.id;
+
+      // Unassign leads for this employee
+      const assignedSnap = await leadsCol.where('assignedTo', '==', empId).get();
+      const batch = db.batch();
+      assignedSnap.docs.forEach(d => batch.update(d.ref, { assignedTo: null }));
+      batch.delete(employeesCol.doc(empId));
+      await batch.commit();
+
+      res.json({ success: true });
+    } catch (err: any) {
+      console.error('Delete employee error:', err);
+      res.status(500).json({ error: 'Failed to delete employee' });
+    }
   });
 
   // ── Admin Profile ─────────────────────────────────────────────────────────────
 
   app.patch('/api/admin/profile', requireAdmin, async (req, res) => {
-    const { name, loginId, password } = req.body;
+    try {
+      const adminProfile = await getAdminProfile();
+      const updates: Partial<AdminProfile> = {};
 
-    if (loginId !== undefined) {
-      const newLoginId = sanitizeStr(loginId, MAX_LOGIN_ID_LEN);
-      const isDuplicate = employees.some(e => e.loginId?.toLowerCase() === newLoginId.toLowerCase());
-      if (isDuplicate) return res.status(400).json({ error: 'Login ID already exists as an employee' });
-      adminProfile.loginId = newLoginId;
+      if (req.body.loginId !== undefined) {
+        const newLoginId = sanitizeStr(req.body.loginId, MAX_LOGIN_ID_LEN);
+        const dupSnap = await employeesCol.where('loginId', '==', newLoginId).limit(1).get();
+        if (!dupSnap.empty) return res.status(400).json({ error: 'Login ID already exists as an employee' });
+        updates.loginId = newLoginId;
+      }
+      if (req.body.name !== undefined) {
+        updates.name = sanitizeStr(req.body.name, MAX_NAME_LEN);
+      }
+      if (req.body.password !== undefined) {
+        const newPwd = sanitizeStr(req.body.password, MAX_PASSWORD_LEN);
+        if (newPwd.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
+        updates.passwordHash = await bcrypt.hash(newPwd, BCRYPT_ROUNDS);
+      }
+
+      await configCol.doc('adminProfile').update(updates as any);
+      const updated = { ...adminProfile, ...updates };
+      res.json(sanitizeAdminProfile(updated));
+
+    } catch (err: any) {
+      console.error('Update admin profile error:', err);
+      res.status(500).json({ error: 'Failed to update admin profile' });
     }
-    if (name !== undefined) {
-      adminProfile.name = sanitizeStr(name, MAX_NAME_LEN);
-    }
-    if (password !== undefined) {
-      const newPwd = sanitizeStr(password, MAX_PASSWORD_LEN);
-      if (newPwd.length < 4) return res.status(400).json({ error: 'Password must be at least 4 characters' });
-      adminProfile.passwordHash = await bcrypt.hash(newPwd, BCRYPT_ROUNDS);
-    }
-    res.json(sanitizeAdminProfile(adminProfile));
   });
 
-  // ── Leads ─────────────────────────────────────────────────────────────────────
+  // ── Leads: AI Screenshot Scanner ─────────────────────────────────────────────
 
   app.post('/api/leads/parse-screenshots', requireAdmin, async (req, res) => {
     try {
@@ -315,305 +428,242 @@ async function startServer() {
       }
 
       const ai = getAiClient();
-      const allExtractedLeads: { name: string; phone: string }[] = [];
+      const allExtracted: { name: string; phone: string }[] = [];
 
       for (const imageStr of images) {
-        let mimeType = 'image/png';
-        let base64Data = imageStr;
+        let mimeType = 'image/png', base64Data = imageStr;
         const match = imageStr.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/);
-        if (match) {
-          mimeType = match[1];
-          base64Data = match[2];
-        }
-
-        const imagePart = { inlineData: { mimeType, data: base64Data } };
-        const textPart = {
-          text: `You are an automated lead OCR scanner for Legal Success India. 
-Analyze this screenshot image. Identify all potential customer contact/lead details. 
-Specifically, extract any visible Names and Phone/Mobile numbers. 
-Return a JSON object matching the requested schema. Ensure to clean up the phone numbers (remove formatting characters like spaces, hyphens, brackets, but preserve country codes if relevant).
-If a contact name is missing but a phone number is visible, use a descriptive placeholder like "Lead - Mobile" or similar.
-If no contacts are found, return an empty array.`
-        };
+        if (match) { mimeType = match[1]; base64Data = match[2]; }
 
         const response = await ai.models.generateContent({
           model: 'gemini-3.5-flash',
-          contents: { parts: [imagePart, textPart] },
+          contents: { parts: [
+            { inlineData: { mimeType, data: base64Data } },
+            { text: `Extract all lead Names and Phone numbers from this screenshot. Return JSON.` }
+          ]},
           config: {
             responseMimeType: 'application/json',
             responseSchema: {
               type: Type.OBJECT,
               properties: {
-                leads: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      name: { type: Type.STRING, description: 'Name of the lead/contact' },
-                      phone: { type: Type.STRING, description: 'Clean phone number/mobile number' }
-                    },
-                    required: ['name', 'phone']
-                  }
-                }
-              },
-              required: ['leads']
+                leads: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: {
+                  name: { type: Type.STRING }, phone: { type: Type.STRING }
+                }, required: ['name', 'phone'] }}
+              }, required: ['leads']
             }
           }
         });
 
-        const textResult = response.text;
-        if (textResult) {
+        if (response.text) {
           try {
-            const parsed = JSON.parse(textResult.trim());
-            if (parsed && Array.isArray(parsed.leads)) {
-              allExtractedLeads.push(...parsed.leads);
-            }
-          } catch (e) {
-            console.error('Error parsing JSON response from Gemini:', e);
-          }
+            const parsed = JSON.parse(response.text.trim());
+            if (parsed?.leads) allExtracted.push(...parsed.leads);
+          } catch {}
         }
       }
 
-      const validLeads = allExtractedLeads.filter(l => l.name?.trim() || l.phone?.trim());
-      syncLeadCounts();
-
+      const validLeads = allExtracted.filter(l => l.name?.trim() || l.phone?.trim());
+      const employees = await getEmployees();
+      const batch = db.batch();
       const createdLeads: Lead[] = [];
 
       for (const leadData of validLeads) {
+        const id = randomUUID();
+        const now = new Date().toISOString();
+        const assignee = pickAssignee(employees);
+
         const lead: Lead = {
-          id: randomUUID(),
-          name: sanitizeStr(leadData.name, MAX_NAME_LEN) || 'Lead - Mobile',
-          phone: sanitizeStr(leadData.phone, 20),
-          assignedTo: null,
-          status: 'New',
-          createdAt: new Date().toISOString(),
-          timeline: [{
-            id: randomUUID(),
-            action: 'Lead created via Screenshot OCR scan',
-            user: 'System',
-            timestamp: new Date().toISOString()
-          }]
+          id, name: sanitizeStr(leadData.name, MAX_NAME_LEN) || 'Lead - Mobile',
+          phone: sanitizeStr(leadData.phone, 20), assignedTo: assignee?.id || null,
+          status: 'New', createdAt: now,
+          timeline: [
+            { id: randomUUID(), action: 'Lead created via Screenshot OCR scan', user: 'System', timestamp: now },
+            ...(assignee ? [{ id: randomUUID(), action: `Auto-distributed to ${assignee.name}`, user: 'System', timestamp: now }] : [])
+          ]
         };
 
-        if (employees.length > 0) {
-          const sortedEmployees = [...employees].sort((a, b) => a.leadCount - b.leadCount);
-          const assignee = sortedEmployees[0];
-          lead.assignedTo = assignee.id;
-          assignee.leadCount++;
-          lead.timeline!.push({
-            id: randomUUID(),
-            action: `Auto-distributed to ${assignee.name} (Allocated offline)`,
-            user: 'System',
-            timestamp: new Date().toISOString()
-          });
-        }
+        batch.set(leadsCol.doc(id), lead);
+        if (assignee) assignee.leadCount++;
         createdLeads.push(lead);
       }
 
-      leads.push(...createdLeads);
+      await batch.commit();
       res.json({ success: true, extractedCount: validLeads.length, createdCount: createdLeads.length, leads: createdLeads });
 
     } catch (error: any) {
-      console.error('Error in parse-screenshots endpoint:', error);
+      console.error('Screenshot parse error:', error);
       res.status(500).json({ error: error.message || 'Failed to parse screenshots.' });
     }
   });
 
-  app.post('/api/leads/bulk', requireAdmin, (req, res) => {
-    const rawText = sanitizeStr(req.body.rawText, MAX_BULK_TEXT_LEN);
-    if (!rawText) return res.status(400).json({ error: 'rawText is required' });
+  // ── Leads: Bulk Text ──────────────────────────────────────────────────────────
 
-    const lines = rawText.split('\n').map(l => l.trim()).filter(l => l);
-    syncLeadCounts();
+  app.post('/api/leads/bulk', requireAdmin, async (req, res) => {
+    try {
+      const rawText = sanitizeStr(req.body.rawText, MAX_BULK_TEXT_LEN);
+      if (!rawText) return res.status(400).json({ error: 'rawText is required' });
 
-    const newLeads: Lead[] = [];
+      const lines = rawText.split('\n').map(l => l.trim()).filter(l => l);
+      const employees = await getEmployees();
+      const batch = db.batch();
+      let count = 0;
 
-    for (const line of lines) {
-      const parts = line.split(' ');
-      let phone = '';
-      let name = '';
-
-      if (parts.length > 1) {
-        const lastPart = parts[parts.length - 1];
-        if (/\d/.test(lastPart)) {
-          phone = lastPart.substring(0, 20);
-          name = parts.slice(0, -1).join(' ').substring(0, MAX_NAME_LEN);
+      for (const line of lines) {
+        const parts = line.split(' ');
+        let phone = '', name = '';
+        if (parts.length > 1 && /\d/.test(parts[parts.length - 1])) {
+          phone = parts[parts.length - 1].substring(0, 20);
+          name  = parts.slice(0, -1).join(' ').substring(0, MAX_NAME_LEN);
         } else {
           name = line.substring(0, MAX_NAME_LEN);
         }
-      } else {
-        name = line.substring(0, MAX_NAME_LEN);
+
+        const id  = randomUUID();
+        const now = new Date().toISOString();
+        const assignee = pickAssignee(employees);
+
+        const lead: Lead = {
+          id, name, phone, assignedTo: assignee?.id || null, status: 'New', createdAt: now,
+          timeline: [
+            { id: randomUUID(), action: 'Lead created via bulk raw text upload', user: 'Admin', timestamp: now },
+            ...(assignee ? [{ id: randomUUID(), action: `Auto-distributed to ${assignee.name}`, user: 'System', timestamp: now }] : [])
+          ]
+        };
+        batch.set(leadsCol.doc(id), lead);
+        if (assignee) assignee.leadCount++;
+        count++;
       }
 
-      const lead: Lead = {
-        id: randomUUID(),
-        name,
-        phone,
-        assignedTo: null,
-        status: 'New',
-        createdAt: new Date().toISOString(),
-        timeline: [{
-          id: randomUUID(),
-          action: 'Lead created via bulk raw text upload',
-          user: 'Admin',
-          timestamp: new Date().toISOString()
-        }]
-      };
+      await batch.commit();
+      res.json({ success: true, count });
 
-      if (employees.length > 0) {
-        const sortedEmployees = [...employees].sort((a, b) => a.leadCount - b.leadCount);
-        const assignee = sortedEmployees[0];
-        lead.assignedTo = assignee.id;
-        assignee.leadCount++;
-        lead.timeline!.push({
-          id: randomUUID(),
-          action: `Auto-distributed to ${assignee.name} (Allocated offline)`,
-          user: 'System',
-          timestamp: new Date().toISOString()
-        });
-      }
-
-      newLeads.push(lead);
+    } catch (err: any) {
+      console.error('Bulk leads error:', err);
+      res.status(500).json({ error: 'Failed to add leads' });
     }
-
-    leads.push(...newLeads);
-    res.json({ success: true, count: newLeads.length });
   });
 
-  app.post('/api/leads/bulk-json', requireAdmin, (req, res) => {
-    const { leads: importedLeads, actorName } = req.body;
-    if (!importedLeads || !Array.isArray(importedLeads)) {
-      return res.status(400).json({ error: 'Leads array is required' });
-    }
-    if (importedLeads.length > 5000) {
-      return res.status(400).json({ error: 'Maximum 5000 leads per import' });
-    }
+  // ── Leads: Bulk JSON (CSV import) ─────────────────────────────────────────────
 
-    const newLeads: Lead[] = [];
-    const actor = sanitizeStr(actorName, MAX_NAME_LEN) || 'Admin';
-    syncLeadCounts();
+  app.post('/api/leads/bulk-json', requireAdmin, async (req, res) => {
+    try {
+      const { leads: importedLeads, actorName } = req.body;
+      if (!importedLeads || !Array.isArray(importedLeads)) {
+        return res.status(400).json({ error: 'Leads array is required' });
+      }
+      if (importedLeads.length > 5000) return res.status(400).json({ error: 'Maximum 5000 leads per import' });
 
-    for (const item of importedLeads) {
-      if (!item.name && !item.phone) continue;
+      const actor = sanitizeStr(actorName, MAX_NAME_LEN) || 'Admin';
+      const employees = await getEmployees();
+      const batch = db.batch();
+      let count = 0;
 
-      const lead: Lead = {
-        id: randomUUID(),
-        name: sanitizeStr(item.name, MAX_NAME_LEN) || 'Lead - Mobile',
-        phone: sanitizeStr(item.phone, 20),
-        assignedTo: null,
-        status: item.status || 'New',
-        notes: sanitizeStr(item.notes, MAX_NOTES_LEN),
-        followUpDate: item.followUpDate || undefined,
-        createdAt: new Date().toISOString(),
-        timeline: [{
-          id: randomUUID(),
-          action: 'Lead imported via CSV file',
-          user: actor,
-          timestamp: new Date().toISOString()
-        }]
-      };
+      for (const item of importedLeads) {
+        if (!item.name && !item.phone) continue;
+        const id  = randomUUID();
+        const now = new Date().toISOString();
+        const assignee = pickAssignee(employees);
 
-      if (employees.length > 0) {
-        const sortedEmployees = [...employees].sort((a, b) => a.leadCount - b.leadCount);
-        const assignee = sortedEmployees[0];
-        lead.assignedTo = assignee.id;
-        assignee.leadCount++;
-        lead.timeline!.push({
-          id: randomUUID(),
-          action: `Auto-distributed to ${assignee.name} (Allocated offline)`,
-          user: 'System',
-          timestamp: new Date().toISOString()
-        });
+        const lead: Lead = {
+          id, name: sanitizeStr(item.name, MAX_NAME_LEN) || 'Lead - Mobile',
+          phone: sanitizeStr(item.phone, 20), assignedTo: assignee?.id || null,
+          status: item.status || 'New', notes: sanitizeStr(item.notes, MAX_NOTES_LEN),
+          followUpDate: item.followUpDate || undefined, createdAt: now,
+          timeline: [
+            { id: randomUUID(), action: 'Lead imported via CSV file', user: actor, timestamp: now },
+            ...(assignee ? [{ id: randomUUID(), action: `Auto-distributed to ${assignee.name}`, user: 'System', timestamp: now }] : [])
+          ]
+        };
+        batch.set(leadsCol.doc(id), lead);
+        if (assignee) assignee.leadCount++;
+        count++;
       }
 
-      newLeads.push(lead);
-    }
+      await batch.commit();
+      res.json({ success: true, count });
 
-    leads.push(...newLeads);
-    res.json({ success: true, count: newLeads.length });
+    } catch (err: any) {
+      console.error('Bulk JSON import error:', err);
+      res.status(500).json({ error: 'Failed to import leads' });
+    }
   });
 
-  app.patch('/api/leads/:id', requireAuth, (req, res) => {
-    const lead = leads.find(l => l.id === req.params.id);
-    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+  // ── Lead: Update ──────────────────────────────────────────────────────────────
 
-    const auth = (req as any).auth as AuthPayload;
+  app.patch('/api/leads/:id', requireAuth, async (req, res) => {
+    try {
+      const docRef = leadsCol.doc(req.params.id);
+      const snap = await docRef.get();
+      if (!snap.exists) return res.status(404).json({ error: 'Lead not found' });
 
-    // Employees can only update their own leads
-    if (auth.role === 'employee' && lead.assignedTo !== auth.userId) {
-      return res.status(403).json({ error: 'You can only update leads assigned to you' });
-    }
+      const lead = { id: snap.id, ...snap.data() } as Lead;
+      const auth = (req as any).auth as AuthPayload;
 
-    if (!lead.timeline) lead.timeline = [];
-
-    const actor = sanitizeStr(req.body.actorName, MAX_NAME_LEN) || 'System';
-    const timestamp = new Date().toISOString();
-
-    const allowedStatuses = ['New', 'Contacted', 'Closed'];
-    if (req.body.status && req.body.status !== lead.status) {
-      if (!allowedStatuses.includes(req.body.status)) {
-        return res.status(400).json({ error: 'Invalid status value' });
+      // Employees can only update their own leads
+      if (auth.role === 'employee' && lead.assignedTo !== auth.userId) {
+        return res.status(403).json({ error: 'You can only update leads assigned to you' });
       }
-      lead.timeline.push({
-        id: randomUUID(),
-        action: `Status updated from "${lead.status}" to "${req.body.status}"`,
-        user: actor,
-        timestamp
-      });
-      lead.status = req.body.status;
-    }
 
-    // Only admin can reassign leads
-    if (req.body.assignedTo !== undefined && req.body.assignedTo !== lead.assignedTo) {
-      if (auth.role !== 'admin') {
-        return res.status(403).json({ error: 'Only admin can reassign leads' });
+      const timeline = lead.timeline || [];
+      const updates: Partial<Lead> = {};
+      const actor = sanitizeStr(req.body.actorName, MAX_NAME_LEN) || 'System';
+      const timestamp = new Date().toISOString();
+
+      const allowedStatuses = ['New', 'Contacted', 'Closed'];
+      if (req.body.status && req.body.status !== lead.status) {
+        if (!allowedStatuses.includes(req.body.status)) return res.status(400).json({ error: 'Invalid status value' });
+        timeline.push({ id: randomUUID(), action: `Status updated from "${lead.status}" to "${req.body.status}"`, user: actor, timestamp });
+        updates.status = req.body.status;
       }
-      const oldEmpName = lead.assignedTo ? (employees.find(e => e.id === lead.assignedTo)?.name || 'Unknown') : 'Unassigned';
-      const newEmpName = req.body.assignedTo ? (employees.find(e => e.id === req.body.assignedTo)?.name || 'Unknown') : 'Unassigned';
-      lead.timeline.push({
-        id: randomUUID(),
-        action: `Assignment changed from ${oldEmpName} to ${newEmpName}`,
-        user: actor,
-        timestamp
-      });
-      lead.assignedTo = req.body.assignedTo;
-    }
 
-    if (req.body.notes !== undefined && req.body.notes !== lead.notes) {
-      lead.timeline.push({
-        id: randomUUID(),
-        action: 'Updated lead note details',
-        user: actor,
-        timestamp,
-        notes: sanitizeStr(req.body.notes, MAX_NOTES_LEN)
-      });
-      lead.notes = sanitizeStr(req.body.notes, MAX_NOTES_LEN);
-    }
+      if (req.body.assignedTo !== undefined && req.body.assignedTo !== lead.assignedTo) {
+        if (auth.role !== 'admin') return res.status(403).json({ error: 'Only admin can reassign leads' });
+        const employees = await getEmployees();
+        const oldName = lead.assignedTo ? (employees.find(e => e.id === lead.assignedTo)?.name || 'Unknown') : 'Unassigned';
+        const newName = req.body.assignedTo ? (employees.find(e => e.id === req.body.assignedTo)?.name || 'Unknown') : 'Unassigned';
+        timeline.push({ id: randomUUID(), action: `Assignment changed from ${oldName} to ${newName}`, user: actor, timestamp });
+        updates.assignedTo = req.body.assignedTo;
+      }
 
-    if (req.body.followUpDate !== undefined && req.body.followUpDate !== lead.followUpDate) {
-      const displayDate = req.body.followUpDate
-        ? new Date(req.body.followUpDate).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
-        : 'Removed';
-      lead.timeline.push({
-        id: randomUUID(),
-        action: `Set follow-up reminder for ${displayDate}`,
-        user: actor,
-        timestamp
-      });
-      lead.followUpDate = req.body.followUpDate;
-    }
+      if (req.body.notes !== undefined && req.body.notes !== lead.notes) {
+        const sanitizedNotes = sanitizeStr(req.body.notes, MAX_NOTES_LEN);
+        timeline.push({ id: randomUUID(), action: 'Updated lead note details', user: actor, timestamp, notes: sanitizedNotes });
+        updates.notes = sanitizedNotes;
+      }
 
-    lead.updatedAt = timestamp;
-    syncLeadCounts();
-    res.json(lead);
+      if (req.body.followUpDate !== undefined && req.body.followUpDate !== lead.followUpDate) {
+        const displayDate = req.body.followUpDate
+          ? new Date(req.body.followUpDate).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
+          : 'Removed';
+        timeline.push({ id: randomUUID(), action: `Set follow-up reminder for ${displayDate}`, user: actor, timestamp });
+        updates.followUpDate = req.body.followUpDate;
+      }
+
+      updates.timeline = timeline;
+      updates.updatedAt = timestamp;
+
+      await docRef.update(updates as any);
+      const updatedLead = { ...lead, ...updates };
+      res.json(updatedLead);
+
+    } catch (err: any) {
+      console.error('Update lead error:', err);
+      res.status(500).json({ error: 'Failed to update lead' });
+    }
   });
 
-  app.delete('/api/leads/:id', requireAdmin, (req, res) => {
-    const leadIndex = leads.findIndex(l => l.id === req.params.id);
-    if (leadIndex === -1) return res.status(404).json({ error: 'Lead not found' });
-    leads.splice(leadIndex, 1);
-    syncLeadCounts();
-    res.json({ success: true });
+  // ── Lead: Delete ──────────────────────────────────────────────────────────────
+
+  app.delete('/api/leads/:id', requireAdmin, async (req, res) => {
+    try {
+      const snap = await leadsCol.doc(req.params.id).get();
+      if (!snap.exists) return res.status(404).json({ error: 'Lead not found' });
+      await leadsCol.doc(req.params.id).delete();
+      res.json({ success: true });
+    } catch (err: any) {
+      console.error('Delete lead error:', err);
+      res.status(500).json({ error: 'Failed to delete lead' });
+    }
   });
 
   // ── Vite Integration ──────────────────────────────────────────────────────────
@@ -627,13 +677,14 @@ If no contacts are found, return an empty array.`
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    app.get('*', (_req, response) => {
+      response.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Server running on http://localhost:${PORT}`);
+    console.log(`🔥 Firestore database connected`);
     console.log(`🔒 JWT authentication enabled`);
   });
 }
