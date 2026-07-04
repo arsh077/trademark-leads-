@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Users, UserPlus, ClipboardList, Trash2, Moon, Sun, LayoutList, Menu as MenuIcon, X, Home, Mail, User, Settings, Sparkles, Download, Upload } from 'lucide-react';
 import { Employee, Lead } from '../types';
 import { MenuItem, MenuContainer } from './ui/fluid-menu';
@@ -65,6 +65,85 @@ export function AdminDashboard({
     leads: { id: string; name: string; phone: string; assignedTo: string | null }[];
   } | null>(null);
   const [scanError, setScanError] = useState('');
+
+  // 📋 Global paste handler to paste screenshot directly (Ctrl+V)
+  useEffect(() => {
+    const handlePaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      const imageFiles: File[] = [];
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type.indexOf('image') !== -1) {
+          const file = items[i].getAsFile();
+          if (file) imageFiles.push(file);
+        }
+      }
+
+      if (imageFiles.length > 0) {
+        e.preventDefault();
+        const promises = imageFiles.map(file => {
+          return new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsDataURL(file);
+          });
+        });
+
+        Promise.all(promises)
+          .then(base64Images => {
+            setScreenshots(prev => [...prev, ...base64Images]);
+            setScanError('');
+          })
+          .catch(() => {
+            setScanError('Failed to read pasted image.');
+          });
+      }
+    };
+
+    window.addEventListener('paste', handlePaste);
+    return () => window.removeEventListener('paste', handlePaste);
+  }, []);
+
+  // 📋 Click to Paste from clipboard API fallback
+  const handleClipboardPaste = async (e: React.MouseEvent) => {
+    e.stopPropagation(); // Prevent opening file picker
+    try {
+      const clipboardItems = await navigator.clipboard.read();
+      const imageFiles: File[] = [];
+
+      for (const item of clipboardItems) {
+        for (const type of item.types) {
+          if (type.startsWith('image/')) {
+            const blob = await item.getType(type);
+            const file = new File([blob], 'screenshot.png', { type });
+            imageFiles.push(file);
+          }
+        }
+      }
+
+      if (imageFiles.length === 0) {
+        alert('No image found in clipboard. Copy a screenshot first (Ctrl+C / Snipping tool)!');
+        return;
+      }
+
+      const promises = imageFiles.map(file => {
+        return new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+      });
+
+      const base64Images = await Promise.all(promises);
+      setScreenshots(prev => [...prev, ...base64Images]);
+      setScanError('');
+    } catch (err: any) {
+      alert('Please copy a screenshot first, then use Ctrl+V keyboard shortcut to paste!');
+    }
+  };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
@@ -388,9 +467,19 @@ export function AdminDashboard({
                       </svg>
                     </div>
                     <div className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                      Drag & drop images here or <span className="text-indigo-600 dark:text-indigo-400">browse files</span>
+                      Drag & drop images, <span className="text-indigo-600 dark:text-indigo-400 font-bold">paste (Ctrl+V)</span> or browse
                     </div>
                     <p className="text-[10px] text-slate-400 dark:text-slate-500">Supports PNG, JPG (Select multiple screenshots)</p>
+                    
+                    {/* Visual Paste Button (Interactive) */}
+                    <div className="pt-2 pointer-events-auto">
+                      <button
+                        onClick={handleClipboardPaste}
+                        className="inline-flex items-center gap-1.5 px-3 py-1 text-[11px] font-bold bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700 rounded-md hover:bg-slate-100 dark:hover:bg-slate-700/80 transition-colors shadow-sm cursor-pointer"
+                      >
+                        📋 Click to Paste Screenshot
+                      </button>
+                    </div>
                   </div>
                 </div>
 
