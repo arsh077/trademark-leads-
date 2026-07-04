@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
@@ -7,23 +8,26 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
-import * as admin from 'firebase-admin';
+import { createRequire } from 'module';
 import * as fs from 'fs';
+
+const require = createRequire(import.meta.url);
+const { initializeApp, cert, getApps } = require('firebase-admin/app');
+const { getFirestore } = require('firebase-admin/firestore');
 
 // ─── Firebase Init ──────────────────────────────────────────────────────────────
 // Supports: service account JSON file OR individual env vars
 
 function initFirebase() {
-  if (admin.apps.length > 0) return; // already initialized
+  if (getApps().length > 0) return;
 
-  // Option 1: Full service account JSON file path
   const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
   if (serviceAccountPath) {
     try {
       const raw = fs.readFileSync(serviceAccountPath, 'utf8');
       const serviceAccount = JSON.parse(raw);
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount as admin.ServiceAccount),
+      initializeApp({
+        credential: cert(serviceAccount),
       });
       console.log('✅ Firebase initialized via service account file');
       return;
@@ -39,8 +43,8 @@ function initFirebase() {
   const privateKey  = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 
   if (projectId && clientEmail && privateKey) {
-    admin.initializeApp({
-      credential: admin.credential.cert({ projectId, clientEmail, privateKey }),
+    initializeApp({
+      credential: cert({ projectId, clientEmail, privateKey } as any),
     });
     console.log('✅ Firebase initialized via environment variables');
     return;
@@ -51,7 +55,7 @@ function initFirebase() {
 }
 
 initFirebase();
-const db = admin.firestore();
+const db = getFirestore();
 
 // Firestore collection references
 const employeesCol = db.collection('employees');
