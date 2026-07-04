@@ -26,13 +26,22 @@ const require = createRequire(import.meta.url);
 const { initializeApp, cert, getApps } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
 
-// ─── Firebase Init ──────────────────────────────────────────────────────────────
-// Supports: service account JSON file OR individual env vars
+function cleanEnvVar(val: string | undefined): string | undefined {
+  if (!val) return undefined;
+  let s = val.trim();
+  if (s.startsWith('"') && s.endsWith('"')) {
+    s = s.substring(1, s.length - 1);
+  }
+  if (s.startsWith("'") && s.endsWith("'")) {
+    s = s.substring(1, s.length - 1);
+  }
+  return s;
+}
 
 function initFirebase() {
   if (getApps().length > 0) return;
 
-  const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+  const serviceAccountPath = cleanEnvVar(process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
   if (serviceAccountPath) {
     try {
       const raw = fs.readFileSync(serviceAccountPath, 'utf8');
@@ -49,9 +58,12 @@ function initFirebase() {
   }
 
   // Option 2: Individual environment variables (easier for deployment)
-  const projectId   = process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  const privateKey  = process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+  const projectId   = cleanEnvVar(process.env.FIREBASE_PROJECT_ID);
+  const clientEmail = cleanEnvVar(process.env.FIREBASE_CLIENT_EMAIL);
+  let privateKey    = cleanEnvVar(process.env.FIREBASE_PRIVATE_KEY);
+  if (privateKey) {
+    privateKey = privateKey.replace(/\\n/g, '\n');
+  }
 
   console.log('🔍 Firebase Diagnostic Info:', {
     FIREBASE_SERVICE_ACCOUNT_PATH: serviceAccountPath ? 'exists' : 'missing/empty',
@@ -61,11 +73,16 @@ function initFirebase() {
   });
 
   if (projectId && clientEmail && privateKey) {
-    initializeApp({
-      credential: cert({ projectId, clientEmail, privateKey } as any),
-    });
-    console.log('✅ Firebase initialized via environment variables');
-    return;
+    try {
+      initializeApp({
+        credential: cert({ projectId, clientEmail, privateKey } as any),
+      });
+      console.log('✅ Firebase initialized via environment variables');
+      return;
+    } catch (e: any) {
+      console.error('❌ Failed to initialize Firebase via env variables:', e.message);
+      process.exit(1);
+    }
   }
 
   console.error('❌ Firebase not configured! Set FIREBASE_SERVICE_ACCOUNT_PATH or (FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY)');
