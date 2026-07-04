@@ -72,6 +72,16 @@ function initFirebase() {
     FIREBASE_PRIVATE_KEY: privateKey ? `exists (length: ${privateKey.length})` : 'missing/empty'
   });
 
+  if (privateKey) {
+    console.log('🔑 Private Key Check:', {
+      startsWithHeader: privateKey.startsWith('-----BEGIN PRIVATE KEY-----'),
+      endsWithFooter: privateKey.trim().endsWith('-----END PRIVATE KEY-----'),
+      containsNewlines: privateKey.includes('\n'),
+      first40: privateKey.substring(0, 40),
+      last40: privateKey.substring(privateKey.length - 40)
+    });
+  }
+
   if (projectId && clientEmail && privateKey) {
     try {
       initializeApp({
